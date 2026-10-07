@@ -3,7 +3,8 @@
 > **Status:** Draft for review, 2026-10-07.
 > **This document replaces `ConsentSeal-TECHSPEC-CLAUDE-CODE.md` as the single source of truth for building ConsentSeal.** `ConsentSeal-DESIGN.md` (v1) and the TECHSPEC are kept for history only. Where they disagree with this document, this document wins.
 > Inputs: `ConsentSeal-BACKGROUND.md`, `ConsentSeal-DESIGN.md`, `ConsentSeal-TECHSPEC-CLAUDE-CODE.md`, `field-mapping.md`, Experiments 01 and 02 (both built and verified), and all rulings made in review up to 2026-10-07.
-> Items marked **[Lawyer]** need legal sign-off before Phase 3. Items marked **[Default]** were proposed by Claude Code and accepted by Steven on 2026-10-07.
+> Items marked **[Lawyer]** need legal sign-off before Phase 3. Items marked **[Default]** were proposed by Claude Code and accepted by Steven on 2026-10-07. Items marked **[Provisional]** are working assumptions not yet confirmed by Steven (listed in §24.2).
+> **Revision 2026-10-07 (b): v1 supports remote signing.** Clients can sign both forms on their own phone (identity = phone + email match only), or in the clinic on the tablet with a staff witness. Updates and re-consent can also be done remotely.
 
 ---
 
@@ -49,9 +50,11 @@
 ConsentSeal replaces the paper forms:
 
 1. The client fills in the intake form on their phone before the visit (or on arrival).
-2. At the clinic, the client reviews it, reads the consent, and signs by hand on a tablet, with a staff member as witness.
-3. At that moment the system produces the signed PDFs, **seals** them (fingerprint, trusted timestamp, tamper-proof storage) and records who, when, and what in a tamper-evident log.
-4. When an insurer asks, the clinic finds and downloads the sealed PDFs in seconds, and can prove they were not changed.
+2. Front desk prepares the consent details when booking (therapist, treatment areas, scope).
+3. The client signs by hand, either **remotely on their own phone** once everything is complete, or **in the clinic on a tablet** with a staff member as witness.
+4. At that moment the system produces the signed PDFs, **seals** them (fingerprint, trusted timestamp, tamper-proof storage) and records who, when, how and what in a tamper-evident log.
+5. Before treatment, the therapist records that they discussed the treatment with the client; at the first visit, front desk records an in-person ID check for clients who signed remotely.
+6. When an insurer asks, the clinic finds and downloads the sealed PDFs in seconds, and can prove they were not changed.
 
 **Goal:** the electronic record must be **stronger evidence than paper**, not merely equivalent.
 
@@ -76,14 +79,14 @@ Breaking any of these is a design failure.
 
 **In v1**
 
-- Client area: identity gate, intake form with autosave, "please come in to sign" page.
-- Tablet signing area: preview, full consent text, 9 confirmations, treatment areas and therapist, handwritten signature, witness with PIN, Sign & Seal. Also used for updates and re-consent.
-- Back office: login, client search, pre-registration and CSV import, signing sessions, downloads, one-click verification, bulk export, email/SMS invitations, audit viewer, user and consent-version management.
+- Client area: identity gate, intake form with autosave, **remote signing** (preview, full consent text, 9 confirmations, handwritten signature, Sign & Seal), remote updates and re-consent.
+- Tablet signing area (in clinic): the same signing steps plus a staff witness with PIN. Also used for updates and re-consent.
+- Back office: login, client search, pre-registration and CSV import, **consent preparation** (therapist, areas, scope), signing sessions, **in-person ID check record**, **therapist discussion record**, downloads, one-click verification, bulk export, email/SMS invitations, audit viewer, user and consent-version management.
 - Sealing: two PDFs (consent + intake with attestation page), SHA-256, RFC 3161 timestamp, S3 Object Lock, hash-chained audit log, daily anchors.
 
 **Not in v1**
 
-- Remote (at-home) signing. Signing happens only in the clinic.
+- One-time codes (SMS/email) or ID-document checks for remote signing. Remote identity relies on the phone + email match only (accepted risk, §15.6).
 - Legal guardian / substitute decision-maker signing. Clients under the age threshold use the paper process.
 - Address autocomplete (Mapbox), because it sends typed addresses outside Canada.
 - Per-client invitation links. Invitations use one generic link plus the identity gate.
@@ -96,8 +99,9 @@ See §26 for the future list.
 
 | Role | Who | Can do |
 |---|---|---|
-| **Client** | A spa client. No account. | Pass the identity gate, fill in and resume their own intake draft, sign on the tablet. |
-| **Front desk** (`frontdesk`) | Clinic staff with a named account and a 6-digit PIN. | Search clients, pre-register clients, open signing sessions, witness signatures (PIN), start updates, delete abandoned drafts, download PDFs (logged), verify records, see a client's audit trail. |
+| **Client** | A spa client. No account. | Pass the identity gate, fill in and resume their own intake draft, sign remotely on their phone or on the clinic tablet, complete updates and re-consent the front desk has started. |
+| **Front desk** (`frontdesk`) | Clinic staff with a named account and a 6-digit PIN. | Search clients, pre-register clients, prepare consent details, open signing sessions, witness signatures (PIN), record in-person ID checks, start updates and re-consent requests, delete abandoned drafts, download PDFs (logged), verify records, see a client's audit trail. |
+| **Therapist** (`therapist`) **[Provisional]** | Practitioner with a named account and a 6-digit PIN. | Appears in the therapist list for consent preparation; records the pre-treatment discussion with PIN; sees their own clients' consent status. No access to exports, invitations or administration. |
 | **Admin** (`admin`) | Owner / manager. | Everything front desk can do, plus: manage staff accounts and PINs, unlock PINs, publish consent versions, global audit view, bulk export, invitations (email/SMS), CSV import. |
 | **System** (`system`) | Background jobs. | Send invitations, retry timestamps, write daily anchors, detect orphaned files. |
 | **Insurer / auditor** | External. No system access. | Receives PDFs (and optionally the timestamp token) from the clinic and can verify them independently with standard tools. |
@@ -211,7 +215,7 @@ stateDiagram-v2
   [*] --> NOT_STARTED: front desk pre-registers / CSV import
   [*] --> DRAFT: walk-in passes gate (new phone)
   NOT_STARTED --> DRAFT: client passes gate (phone + email match)
-  DRAFT --> SEALED: Sign & Seal on tablet
+  DRAFT --> SEALED: Sign & Seal (remote on phone, or tablet in clinic)
   DRAFT --> [*]: front desk deletes abandoned draft
   SEALED --> SEALED: update or re-consent sealed (new document version)
 ```
@@ -232,13 +236,24 @@ v1 (initial) ← v2 (update 1) ← v3 (update 2) ...
 - A version is never changed after sealing.
 - Downloads default to the current version; older versions remain available and verifiable.
 
-### 7.3 Signing session modes
+### 7.3 Signing channels and modes
 
-| Mode | Opened when | Documents sealed |
+Every seal has a **channel**:
+
+| Channel | Where | Identity evidence at signing | Witness |
+|---|---|---|---|
+| `remote` | Client's own device, through the client area | Phone + email match at the gate, IP address, device | None. ID is checked in person at the first visit afterwards (§13.4). |
+| `in_store` | Clinic tablet, through a pairing code | Phone + email (if any) plus in-person ID check | Staff member, confirmed by PIN |
+
+And a **mode**:
+
+| Mode | Available when | Documents sealed |
 |---|---|---|
-| `initial` | Client has a complete DRAFT | intake + consent |
-| `update` | Front desk started an intake update | intake (and consent if the client also re-signs it) |
-| `reconsent` | Client's consent is on an older bundle version | consent only |
+| `initial` | Intake draft complete **and** consent prepared by front desk | intake + consent, with one signature |
+| `update` | Front desk started an intake update, and the update draft is complete | intake (plus consent if a consent re-sign is also pending) |
+| `reconsent` | Front desk prepared a new consent (new bundle or changed treatment) | consent only |
+
+**The signature step is shown only when everything to be signed is complete** (Steven, 2026-10-07): the client never sees the signature pad while any intake answer or any consent detail is missing.
 
 ## 8. Database design
 
@@ -254,8 +269,14 @@ erDiagram
   clients ||--o{ sealed_documents : has
   clients ||--o{ update_drafts : has
   clients ||--o{ signing_sessions : has
+  clients ||--o{ consent_preparations : has
+  clients ||--o{ identity_verifications : has
+  clients ||--o{ treatment_discussions : has
   admin_users ||--o{ signing_sessions : opens
   admin_users ||--o{ consent_records : witnesses
+  admin_users ||--o{ consent_preparations : "prepares / is therapist"
+  admin_users ||--o{ treatment_discussions : records
+  sealed_documents ||--o{ treatment_discussions : "for consent"
   sealed_documents ||--o| sealed_documents : supersedes
   consent_bundles ||--o{ sealed_documents : "rendered with"
   blast_runs ||--o{ blast_recipients : contains
@@ -356,7 +377,8 @@ Clinic-only fields on the paper form (Notes) are left blank in v1 **[Default]**.
 | Column | Type | Notes |
 |---|---|---|
 | client_id | uuid PK, FK clients | |
-| therapist_name | text NOT NULL | "offered to me by ___" |
+| therapist_id | uuid NOT NULL, FK admin_users (role therapist) | **[Provisional]** chosen from the therapist list |
+| therapist_name | text NOT NULL | printed on "offered to me by ___" (display name at the time of signing) |
 | treatment_areas | text[] NOT NULL | at least one of `head_neck`, `face_mouth`, `back_upper_mid_lower`, `shoulder_arm`, `elbow_wrist_hand`, `stomach`, `leg`, `knees`, `ankle_feet`, `others` |
 | treatment_areas_other_text | text NULL | required if `others` selected; otherwise NULL |
 | consent_scope_with | text NOT NULL | "all my present and future care with ___" |
@@ -366,10 +388,11 @@ Clinic-only fields on the paper form (Notes) are left blank in v1 **[Default]**.
 | esignature_agreed_at | timestamptz NOT NULL | 9th box ("I agree to sign electronically") |
 | signed_at | timestamptz NOT NULL | |
 | signed_as | text NOT NULL DEFAULT `patient` | v1 only `patient` |
-| witnessed_by_admin_id | uuid NOT NULL, FK admin_users | PIN-confirmed witness |
-| witness_id_type | text NOT NULL | `drivers_licence`, `health_card`, `passport` (ID number never stored) **[Lawyer: health card, see §24]** |
+| signing_channel | text NOT NULL | `remote`, `in_store` |
+| witnessed_by_admin_id | uuid NULL, FK admin_users | PIN-confirmed witness; required when `in_store`, NULL when `remote` |
+| witness_id_type | text NULL | `drivers_licence`, `health_card`, `passport` (ID number never stored); required when `in_store` **[Lawyer: health card, see §24]** |
 
-This replaces the TECHSPEC's two version columns with one `bundle_version`, since they were always equal by design.
+This replaces the TECHSPEC's two version columns with one `bundle_version`, since they were always equal by design. The consent details (therapist, areas, scope) are copied here from the consent preparation (§8.13) at sealing.
 
 ### 8.5 `sealed_documents`
 
@@ -383,6 +406,7 @@ This replaces the TECHSPEC's two version columns with one `bundle_version`, sinc
 | is_current | boolean NOT NULL | |
 | bundle_version | int NOT NULL, FK consent_bundles | template + text + coordinates used |
 | signing_session_id | uuid NOT NULL, FK signing_sessions | |
+| signing_channel | text NOT NULL | `remote`, `in_store` |
 | s3_bucket / s3_key | text NOT NULL | key `sealed-pdfs/{yyyy}/{MM}/{id}.pdf`; no personal data in keys |
 | sha256 | char(64) NOT NULL | lowercase hex of the PDF bytes only |
 | file_size | int NOT NULL | |
@@ -401,8 +425,8 @@ Rows are only inserted after the file is safely stored (§11.4). Files in S3 wit
 |---|---|---|
 | id | uuid PK | |
 | client_id | uuid NOT NULL, FK clients | partial UNIQUE where status = `open` (one open update per client) |
-| document_type | text NOT NULL | `intake` (consent changes are captured inside the signing session) |
-| draft_data | jsonb NOT NULL | same fields as `intake_forms`, pre-filled from the current data |
+| document_type | text NOT NULL | `intake` (consent changes go through `consent_preparations`) |
+| draft_data | jsonb NOT NULL | same fields as `intake_forms`, pre-filled from the current data; edited by the client remotely or on the tablet |
 | initiated_by | uuid NOT NULL, FK admin_users | |
 | status | text NOT NULL | `open`, `sealed`, `cancelled` |
 | created_at / closed_at | timestamptz | |
@@ -413,18 +437,19 @@ Rows are only inserted after the file is safely stored (§11.4). Files in S3 wit
 |---|---|---|
 | id | uuid PK | |
 | client_id | uuid NOT NULL, FK clients | |
+| channel | text NOT NULL | `remote`, `in_store` |
 | mode | text NOT NULL | `initial`, `update`, `reconsent` |
 | documents | text[] NOT NULL | subset of `intake`, `consent` |
-| opened_by | uuid NOT NULL, FK admin_users | |
-| pairing_code_hash | text NULL | 6-digit code to open the session on the tablet (§11.2) |
-| pairing_expires_at | timestamptz | 5 minutes |
+| opened_by | uuid NULL, FK admin_users | staff who opened it (`in_store`); NULL for `remote` (opened by the client) |
+| pairing_code_hash | text NULL | `in_store` only: 6-digit code to open the session on the tablet (§11.2) |
+| pairing_expires_at | timestamptz NULL | 5 minutes |
 | paired_at | timestamptz NULL | |
-| expires_at | timestamptz NOT NULL | 30 minutes after pairing |
+| expires_at | timestamptz NOT NULL | `in_store`: 30 minutes after pairing; `remote`: 30 minutes after opening |
 | status | text NOT NULL | `open`, `paired`, `sealed`, `expired`, `cancelled` |
-| client_ip / user_agent | text NULL | recorded at pairing and at sealing |
+| client_ip / user_agent | text NULL | recorded when opened/paired and at sealing |
 | created_at | timestamptz | |
 
-One open or paired session per client at a time.
+One open or paired session per client at a time. A remote session is created automatically when the client reaches the signing step with everything complete.
 
 ### 8.8 `audit_log` (append-only)
 
@@ -449,7 +474,7 @@ Enforcement: a `BEFORE UPDATE OR DELETE` trigger raises an error, and the applic
 | id | uuid PK | |
 | username | text UNIQUE NOT NULL | |
 | display_name | text NOT NULL | real name, shown as witness |
-| role | text NOT NULL | `frontdesk`, `admin` |
+| role | text NOT NULL | `frontdesk`, `admin`, `therapist` **[Provisional]** |
 | password_hash | text NOT NULL | PBKDF2 (Identity PasswordHasher) |
 | login_failed_attempts / login_locked_until | int / timestamptz | 5 failures in 15 min → locked 15 min |
 | pin_hash | text NOT NULL | bcrypt of a 6-digit PIN |
@@ -464,7 +489,7 @@ The first admin is created with a one-time command, `ConsentSeal.Api create-admi
 | Column | Type | Notes |
 |---|---|---|
 | version | int PK | |
-| consent_text | text NOT NULL | full verbatim text shown on the tablet (risks, acknowledgements, understandings, e-signature agreement) |
+| consent_text | text NOT NULL | full verbatim text shown at signing, on the phone or tablet (risks, acknowledgements, understandings, e-signature agreement) |
 | consent_template_path / intake_template_path | text NOT NULL | e.g. `templates/v1/...` |
 | template_sha256 | char(64) NOT NULL | both template files are hashed at startup and must match |
 | coordinates | jsonb NOT NULL | every overlay position (§12) |
@@ -483,9 +508,59 @@ A bundle is the unit of change: **consent text + PDF templates + coordinates alw
 
 id, s3_key, detected_at, resolved_at, resolution_note. Filled by the daily sweeper (§21.5).
 
+### 8.13 `consent_preparations`
+
+Consent details are prepared by front desk (usually when booking) before the client can sign.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | uuid PK | |
+| client_id | uuid NOT NULL, FK clients | partial UNIQUE where status = `open` |
+| therapist_id | uuid NOT NULL, FK admin_users (role therapist) | **[Provisional]** |
+| treatment_areas | text[] NOT NULL | at least one (values as §8.4) |
+| treatment_areas_other_text | text NULL | required if `others` |
+| consent_scope_with | text NOT NULL | |
+| reason | text NOT NULL | `initial`, `new_bundle`, `treatment_change` |
+| prepared_by | uuid NOT NULL, FK admin_users | |
+| status | text NOT NULL | `open`, `sealed`, `cancelled` |
+| notified_at | timestamptz NULL | "ready to sign" message sent **[Provisional]** |
+| created_at / closed_at | timestamptz | |
+
+The client sees these details read-only on the signing screen. If something is wrong, the client asks the front desk to change them; they cannot edit them.
+
+### 8.14 `identity_verifications`
+
+In-person ID checks. Required once for clients who signed remotely; recorded automatically for in-store seals.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | uuid PK | |
+| client_id | uuid NOT NULL, FK clients | |
+| method | text NOT NULL | `in_store_signing` (automatic at an in-store seal), `first_visit` (front desk after a remote seal) |
+| id_type | text NOT NULL | `drivers_licence`, `health_card`, `passport` (no number) |
+| verified_by | uuid NOT NULL, FK admin_users | PIN-confirmed |
+| verified_at | timestamptz NOT NULL | |
+
+Recording a verification never changes a sealed document. It is a separate, audited fact linked to the client.
+
+### 8.15 `treatment_discussions`
+
+The therapist's record that they discussed the treatment with the client before treating, as the consent text states ("I acknowledge I have discussed…").
+
+| Column | Type | Notes |
+|---|---|---|
+| id | uuid PK | |
+| client_id | uuid NOT NULL, FK clients | |
+| consent_document_id | uuid NOT NULL, FK sealed_documents | the consent version the discussion covers |
+| therapist_id | uuid NOT NULL, FK admin_users | PIN-confirmed |
+| topics_confirmed | text[] NOT NULL | `condition`, `nature`, `risks_benefits`, `alternatives` (all four required) |
+| discussed_at | timestamptz NOT NULL | |
+
+Required for every remotely signed consent; recorded for in-store consents too **[Provisional]**. The system cannot block treatment; missing discussions show as a badge and in a back-office list.
+
 ## 9. Identity gate
 
-There are no client accounts. A client proves who they are with **phone + email**. Names are recorded, never matched (spelling varies).
+There are no client accounts. A client proves who they are with **phone + email**. Names are recorded, never matched (spelling varies). **This is also the only identity check before remote signing** (Steven, 2026-10-07): no one-time code is sent. The resulting risk is described in §15.6.
 
 ### 9.1 Matching rules
 
@@ -496,7 +571,8 @@ The phone is the key (unique). The email confirms it.
 | No | — | — | `new` | Create client (status DRAFT, names from the form). Issue draft token. Audit `identity_gate.pass`, `draft.created`. |
 | Yes | Yes | NOT_STARTED | `draft` | Status → DRAFT. Issue draft token; form pre-filled with names, phone, email, address. Audit `identity_gate.pass`, `draft.created`. |
 | Yes | Yes | DRAFT | `draft` | Issue draft token; saved answers restored. Audit `identity_gate.pass`, `draft.resumed`. |
-| Yes | Yes | SEALED | `sealed` | No token. "Our records show you have already completed your forms. To update them, please speak to the front desk." Audit `identity_gate.reject` (reason `sealed`). |
+| Yes | Yes | SEALED, with an open update draft or an open consent preparation | `action_required` | Issue draft token scoped to the pending update and/or re-consent. Audit `identity_gate.pass` (reason `pending_action`). |
+| Yes | Yes | SEALED, nothing pending | `sealed` | No token. "Our records show you have already completed your forms. To update them, please speak to the front desk." Audit `identity_gate.reject` (reason `sealed`). |
 | Yes | No | any | `contact_frontdesk` | No token, nothing revealed. "We found a record that needs the front desk's help." Audit `identity_gate.reject` (reason `partial_match`). **[Default]** |
 
 An email that matches someone else but with a new phone is treated as a new client (families share emails).
@@ -516,7 +592,7 @@ An email that matches someone else but with a new phone is treated as a new clie
 - The first section (name, phone, email, address) is pre-filled from the gate and can be corrected; changes are re-checked for duplicates.
 - **Autosave:** each change is saved after 1 second of inactivity (`PUT /api/draft`). Nothing is lost if the client leaves.
 - **Validation timing:** nothing is flagged while typing; missing items are highlighted on leaving a field or on "Next".
-- The client cannot continue to the "done" page until the form is complete. The backend validates again at sealing and does not trust the browser.
+- When the form is complete the client submits it. If front desk has already prepared the consent details, the client continues straight to signing (§11.6). Otherwise the "done" page says: "Thank you. We will let you know when your forms are ready to sign. You can also sign at the clinic." The backend validates again at sealing and does not trust the browser.
 - Progress bar ("62% complete") and a sticky bottom bar with "Next" and "3 items left".
 - Sections (mobile first, single column):
   1. About you (name, phone, email, address, date of birth, occupation)
@@ -528,7 +604,9 @@ An email that matches someone else but with a new phone is treated as a new clie
 
 ## 11. Signing session and sealing
 
-### 11.1 Signing flow (initial)
+Two channels share the same signing steps, the same sealing code and the same PDFs. Differences are listed in §7.3. §11.1–§11.3 describe the in-store tablet; §11.6 describes remote signing.
+
+### 11.1 Signing flow (in store, initial)
 
 ```mermaid
 sequenceDiagram
@@ -541,7 +619,7 @@ sequenceDiagram
   participant S3 as S3 (Object Lock)
 
   FD->>API: POST /api/signing/session {clientId, mode: initial}
-  API->>DB: check client DRAFT is complete, no open session
+  API->>DB: check intake complete, consent prepared, no open session
   API-->>FD: pairing code 482913 (valid 5 min)
   C->>API: POST /api/signing/pair {code}
   API-->>C: signing token (30 min)
@@ -553,9 +631,9 @@ sequenceDiagram
   C->>API: POST /api/signing/events {consent.viewed}
   Note over C: ticks 8 confirmations + e-signature agreement
   C->>API: POST /api/signing/events {acknowledgements.confirmed, esignature_agreed}
-  Note over C: selects treatment areas, therapist, scope; signs on pad
+  Note over C: checks prepared treatment areas, therapist, scope (read-only); signs on pad
   FD->>C: checks ID, selects own name, enters PIN on tablet
-  C->>API: POST /api/seal {documents, signature, consent fields, witness, witnessPin, idType}
+  C->>API: POST /api/seal {documents, signature, witness, witnessPin, idType}
   API->>DB: re-validate draft, duplicates, age, PIN
   API->>API: render PDFs, compute SHA-256
   API->>TSA: timestamp request (hash only)
@@ -580,9 +658,9 @@ Why a code: the token never appears in a URL or on a shared screen, and the tabl
 1. **Review** the intake preview (PDF rendered in the browser). "Something is wrong" goes back to editing the draft on the tablet.
 2. **Consent text** in full, verbatim from the bundle. The "Continue" button activates only after scrolling to the end. Records `consent.viewed`.
 3. **Confirmations:** 4 "I acknowledge…" + 4 "I understand…", grouped as on the form, plus "I agree to sign this document electronically" **[Lawyer: wording]**. All 9 required. Records `acknowledgements.confirmed` and `esignature_agreed`.
-4. **Treatment details:** treatment areas (at least one; "others" needs text), therapist name, "future care with". 
+4. **Treatment details** prepared by front desk are shown read-only: therapist, treatment areas, "future care with". "These are not right" stops the session so front desk can correct them.
 5. **Signature** on the pad (finger or stylus). The pad stays inactive until steps 2–4 are done. Clear is available.
-6. **Witness:** front desk confirms the client's ID in person, selects the ID type, selects their own name and enters their PIN. Silent defaults never count.
+6. **Witness:** front desk confirms the client's ID in person, selects the ID type, selects their own name and enters their PIN. Silent defaults never count. This also records an `identity_verifications` row (`in_store_signing`).
 7. **Sign & Seal.** Button disabled until everything is complete.
 8. **Confirmation:** "Your forms are signed and sealed", record IDs and the first 16 characters of each fingerprint. The tablet resets after 30 seconds.
 
@@ -590,18 +668,18 @@ Why a code: the token never appears in a URL or on a shared screen, and the tabl
 
 All in one request to `POST /api/seal`:
 
-1. Validate the signing token and session (paired, not expired, not used).
-2. Load the client and the data to seal (current draft or update draft).
-3. Re-validate: intake completeness and conditional rules (§8.3); consent fields; duplicate check; the 9 confirmations were recorded in this session.
+1. Validate the token and session: `in_store` = signing token, session paired; `remote` = draft token, remote session open. Not expired, not used.
+2. Load the client and the data to seal (current draft or update draft, and the open consent preparation).
+3. Re-validate: intake completeness and conditional rules (§8.3); consent preparation complete; duplicate check; the 9 confirmations were recorded in this session.
 4. **Age check:** age on the signing date (America/Toronto) below `MINOR_AGE_THRESHOLD` (default 18) → refuse: "Please ask the front desk about the guardian/paper process." **[Lawyer: threshold]**
-5. **Witness PIN check** with lockout (§8.9).
+5. **Witness PIN check** with lockout (§8.9) — `in_store` only. A remote request that contains witness fields is rejected.
 6. Validate the signature PNG: data URL, valid base64, PNG signature, decodes, at most 2 MB.
 7. Allocate document IDs and version numbers.
 8. Render the PDFs (§12) from the active bundle. The intake attestation page prints the Record ID.
 9. Compute SHA-256 of each PDF.
 10. Request an RFC 3161 timestamp for each hash (5-second timeout). On failure, mark `pending`; a background job retries.
 11. Upload each PDF to S3 with Object Lock retention and a SHA-256 checksum header.
-12. **One database transaction:** insert `sealed_documents`; flip `is_current` on previous versions; update client status and `first_sealed_at`; update `consent_records` / `intake_forms` (from the update draft if any); close the session and update draft; write audit entries (`signature.captured`, `document.sealed` per document, plus `intake.updated` or `consent.reconsented`).
+12. **One database transaction:** insert `sealed_documents`; flip `is_current` on previous versions; update client status and `first_sealed_at`; update `consent_records` (from the consent preparation) / `intake_forms` (from the update draft if any); close the session, update draft and consent preparation; for `in_store`, insert `identity_verifications`; write audit entries (`signature.captured`, `document.sealed` per document with the channel, plus `intake.updated` or `consent.reconsented`).
 13. Respond with the documents and their fingerprints.
 
 ### 11.5 Failure handling
@@ -613,7 +691,43 @@ All in one request to `POST /api/seal`:
 | S3 upload fails | 503; nothing in the database; client can retry (new document IDs). |
 | S3 succeeded, database transaction fails | 500. The files stay in S3 (Compliance mode cannot delete them). The daily sweeper records them in `storage_orphans` for review. The client can retry; the retry creates new files. |
 | Double submit | The session is closed in the same transaction; the second request finds it used and returns 409. |
-| Session expired mid-way | 401; front desk opens a new session. Nothing is lost: draft data is in the database. |
+| Session expired mid-way | 401; in store, front desk opens a new session; remotely, the client starts the signing step again. Nothing is lost: draft data is in the database. |
+
+### 11.6 Remote signing
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor C as Client (own phone)
+  actor FD as Front desk
+  participant API as Web API
+  participant DB as PostgreSQL
+  participant MSG as SES / SNS
+
+  C->>API: POST /api/gate/check {names, phone, email}
+  API-->>C: draft token
+  C->>API: PUT /api/draft (autosave) ... POST /api/draft/submit
+  FD->>API: POST /api/admin/clients/{id}/consent-preparation {therapist, areas, scope}
+  API->>MSG: "Your forms are ready to sign" (first name + link) [Provisional]
+  C->>API: gate again (if token expired)
+  C->>API: POST /api/remote-signing/start
+  API->>DB: check intake complete + consent prepared, create remote session
+  API-->>C: session, consent text, preview links
+  Note over C: same steps as tablet: review, full consent text (scroll to end), 9 confirmations, prepared details (read-only), signature
+  C->>API: POST /api/seal {documents, signature}
+  API->>API: same sealing steps as §11.4, channel remote, no witness
+  API-->>C: sealed
+  Note over FD: at first visit: record in-person ID check (§13.4); therapist records discussion before treatment (§13.5)
+```
+
+Rules:
+
+- The signing step appears only when the intake is complete **and** the consent has been prepared (§7.3). If the consent is not prepared yet, the client sees "We will let you know when your forms are ready to sign."
+- Same steps and wording as the tablet (§11.3), except step 6 (no witness).
+- The signature pad works with a finger on phones (as Experiment 02, `touch-action: none`, device-pixel-ratio aware).
+- IP address and device (user agent) are recorded at session start and at sealing.
+- The remote session expires 30 minutes after it starts; the draft token (24 h) must also be valid.
+- The client can always choose to sign in the clinic instead.
 
 ## 12. PDF generation
 
@@ -668,7 +782,8 @@ Name: First Last
 Date: YYYY-MM-DD
 Record ID: <sealed_documents.id>
 Version: <n> (supersedes <previous Record ID> if any)
-Witnessed by: <staff display name>
+Signed: in the clinic, witnessed by <staff display name>
+    or: remotely on the client's device
 ```
 
 The page does **not** print the document's own SHA-256 (printing it would change the file and the hash). The fingerprint lives in the database and the timestamp token.
@@ -695,24 +810,46 @@ sequenceDiagram
   API->>DB: new intake version (supersedes previous), intake_forms overwritten, update draft sealed, audit intake.updated
 ```
 
-- Updates happen **only on the tablet in the clinic**, within one witnessed session. No remote update links in v1.
+- Updates are **started by front desk** **[Provisional]**: the client then completes them either **remotely** (gate → `action_required` → edit the pre-filled form → sign) or **on the tablet** in the clinic (diagram above).
+- Clients cannot start an update themselves; a sealed client with nothing pending gets the `sealed` message at the gate.
+- When front desk starts an update, the client is sent a message with the generic link **[Provisional]**.
 - The client's status stays `SEALED`; the previous version remains valid until the new one is sealed.
-- If the client does not finish, the update draft stays open for the next visit. Front desk can cancel it.
+- If the client does not finish, the update draft stays open. Front desk can cancel it.
 - Previous structured data is overwritten; history lives in the sealed PDFs and the audit log.
 
-### 13.2 Re-consent (new consent bundle)
+### 13.2 Re-consent (new bundle or changed treatment)
 
 - After a new bundle is published, clients whose current consent uses an older bundle get a **"Re-sign consent"** badge in the back office.
-- At the next visit, front desk opens a session with `mode: reconsent, documents: [consent]`. The client goes through steps 2–7 of §11.3.
-- Audit `consent.reconsented`. No bulk notification.
+- When the planned treatment changes (other areas, other therapist), front desk prepares a new consent (`reason: treatment_change`).
+- Front desk prepares the new consent details; the client is notified **[Provisional]** and signs remotely, or signs on the tablet at the next visit (`mode: reconsent, documents: [consent]`).
+- Audit `consent.reconsented`.
+
+### 13.3 Consent preparation
+
+- Front desk fills in therapist (from the therapist list), treatment areas and "future care with", usually when the client books.
+- Saving it records `consent.prepared`. If the client's intake is already complete, a "ready to sign" message is sent **[Provisional]**.
+- Front desk can change or cancel an open preparation until the client signs. After sealing it is closed.
+
+### 13.4 In-person ID check after remote signing
+
+- A client whose documents were signed remotely and who has no `identity_verifications` row shows the badge **"ID not checked"**.
+- At the first visit, front desk checks a photo ID, selects the ID type, and confirms with their PIN. This records `identity.verified`.
+- The sealed documents are not changed. The check is separate evidence that the person who signed remotely is the person who came in.
+
+### 13.5 Therapist discussion record
+
+- Before the first treatment under a consent version, the therapist confirms the four topics (condition, nature of treatment, risks and benefits, alternatives) and enters their PIN. This records `treatment.discussed`.
+- Required for remotely signed consents, because the client may sign before meeting the therapist, while the consent text says "I acknowledge I have discussed…". Recorded for in-store consents too **[Provisional]**.
+- Missing records show the badge **"Discussion not recorded"** and appear in a back-office list. The system does not block treatment.
 
 ## 14. Back office
 
 | Page | Function |
 |---|---|
 | `/admin/login` | Username + password. Lockout after 5 failures in 15 minutes. |
-| `/admin/clients` | Search by name, phone, email, date range, status; badges: "Re-sign consent", "Update open", "Timestamp pending". Add client. Start signing. Multi-select for export or invitation. |
-| `/admin/clients/:id` | Client details (no health data unless "Show intake" is clicked, which is logged), document versions with download, `.sha256` download, timestamp token download, **Verify** button, start update, cancel update, delete draft, this client's audit trail. |
+| `/admin/clients` | Search by name, phone, email, date range, status, channel; badges: "Ready to prepare consent", "Waiting for client signature", "Re-sign consent", "Update open", "ID not checked", "Discussion not recorded", "Timestamp pending". Add client. Start signing. Multi-select for export or invitation. |
+| `/admin/clients/:id` | Client details (no health data unless "Show intake" is clicked, which is logged), **prepare / change consent details**, document versions with channel and download, `.sha256` download, timestamp token download, **Verify** button, start update, cancel update, **record ID check**, delete draft, this client's audit trail. |
+| `/admin/today` | Today's list for front desk and therapists: clients with "ID not checked" or "Discussion not recorded"; therapists record discussions here with their PIN. |
 | `/admin/import` (admin) | CSV import: `first_name,last_name,phone,email[,street,city,province,postal]`. Duplicates by phone are reported and skipped. Shows a preview before importing. |
 | `/admin/blast` (admin) | Choose recipients (default NOT_STARTED; optionally DRAFT as reminder; SEALED always excluded), channel, preview merged message, send. Progress and per-recipient log. Warns if already invited. |
 | `/admin/audit` (admin) | Global audit log with filters; "Verify chain" runs the full chain check. |
@@ -751,7 +888,8 @@ sequenceDiagram
 
 | Question in a dispute | Evidence |
 |---|---|
-| Who signed? | Client identity gate record, in-person ID check (type recorded), named witness confirmed by PIN, device/IP of the tablet session. |
+| Who signed? | **In store:** identity gate record, in-person ID check at signing (type recorded), named witness confirmed by PIN, tablet session. **Remote:** phone + email match, IP address and device at signing, and later an in-person ID check at the first visit (§13.4). Remote evidence is weaker; see §15.6. |
+| Did the discussion with the practitioner happen? | Therapist's PIN-confirmed discussion record before treatment (§13.5). |
 | What did they see? | Bundle version (verbatim consent text stored), `consent.viewed` after scrolling to the end, preview rendered by the same code as the sealed PDF. |
 | Did they agree knowingly? | `acknowledgements.confirmed` (8 items) and `esignature_agreed`, timestamps in order: viewed → confirmed → signed → sealed. |
 | When? | Server time (NTP), and independently the TSA timestamp: proof that the fingerprint existed at that time. |
@@ -767,12 +905,16 @@ sequenceDiagram
 | `draft.submitted` | client | form complete |
 | `client.created` / `client.imported` | frontdesk / admin | source |
 | `blast.sent` | system | run id, channel, counts |
-| `signing.session_opened` / `.paired` / `.expired` / `.cancelled` | frontdesk / client / system | session id, mode, documents, IP, device |
+| `signing.session_opened` / `.paired` / `.expired` / `.cancelled` | frontdesk / client / system | session id, channel, mode, documents, IP, device |
+| `consent.prepared` / `.prepare_changed` / `.prepare_cancelled` | frontdesk | preparation id, therapist id, reason |
+| `notification.sent` | system | type (`ready_to_sign`, `update_requested`, `reconsent_requested`), channel |
+| `identity.verified` | frontdesk | method, ID type |
+| `treatment.discussed` | therapist | consent document id, topics |
 | `consent.viewed` | client | bundle version |
 | `acknowledgements.confirmed` | client | count = 8 |
 | `esignature_agreed` | client | wording version |
 | `signature.captured` | client | session id, IP, device |
-| `document.sealed` | client (witnessed) | document id, type, version, s3_key, sha256, bundle version, witness id, ID type, tsa_status |
+| `document.sealed` | client | document id, type, version, channel, s3_key, sha256, bundle version, witness id and ID type (in store), IP and device, tsa_status |
 | `document.timestamped` | system | document id, TSA time (for retries) |
 | `intake.updated` / `consent.reconsented` | client | new and previous document ids |
 | `update.started` / `.cancelled` | frontdesk | |
@@ -819,13 +961,27 @@ Anyone with database access could otherwise rewrite the whole chain consistently
 - Production TSA: DigiCert or GlobalSign. Development: freetsa.org.
 - Pending tokens are retried every 10 minutes; an alert fires if any stays pending for 24 hours.
 
+### 15.6 Remote signing: accepted risk
+
+Remote signing relies only on the phone + email match (Steven, 2026-10-07). Anyone who knows a client's phone number and email address (a family member, partner or colleague) could fill in and sign the forms in the client's name. At signing time, the system cannot tell the difference.
+
+What limits the risk:
+
+- The IP address and device are recorded with every remote seal.
+- An in-person ID check is recorded at the first visit (§13.4), and the badge stays until it is done.
+- The therapist records the discussion before treatment (§13.5). The client confirms the details in person at that point.
+- Every remote seal is marked `remote` in the database, the audit log and on the intake attestation page, so no remote record can pass as in-store.
+- Clients can always choose to sign in the clinic instead.
+
+What it does not cover: proof that the client personally signed at the moment of remote signing. This must be put to the lawyer and the insurers (both letters ask about it). A one-time code to the client's phone is the planned upgrade if either requires stronger proof (§26).
+
 ## 16. Security and privacy
 
 ### 16.1 Authentication and tokens
 
 | Token | Who | Lifetime | Scope |
 |---|---|---|---|
-| Draft token (JWT) | client | 24 h | read/write that client's draft only |
+| Draft token (JWT) | client | 24 h | read/write that client's draft (or pending update) only; start remote signing |
 | Pairing code | tablet | 5 min, single use | exchange for a signing token |
 | Signing token (JWT) | tablet | 30 min after pairing | one session: context, preview, events, draft edits (update mode), seal |
 | Staff token (JWT) | staff | 8 h (one shift) | by role |
@@ -849,8 +1005,10 @@ Anyone with database access could otherwise rewrite the whole chain consistently
 | Threat | Mitigation |
 |---|---|
 | Someone guesses a phone/email pair to read another person's draft | Both must match; rate limiting; constant-time response; partial matches reveal nothing. |
+| Someone who knows a client's phone and email signs remotely in their name | Accepted risk (§15.6): IP/device recorded, remote marked on every record, in-person ID check at first visit, therapist discussion record before treatment. |
+| Client signs remotely before speaking to the therapist, making "I have discussed…" untrue at signing | Therapist discussion record before treatment (§13.5); lawyer asked whether the wording or process needs changing. |
 | Phone number enumeration | Rate limiting; responses for unknown phones create a new empty draft (no information revealed). |
-| Staff member forges or backdates a record | Seal only at signing on the tablet with witness PIN; TSA time; Object Lock; hash chain + anchors. |
+| Staff member forges or backdates a record | Seal only happens at the client's signature (tablet with witness PIN, or the client's own device); staff cannot seal on a client's behalf; TSA time; Object Lock; hash chain + anchors. |
 | Staff member edits a sealed PDF | Object Lock Compliance: no overwrite or delete, even by the AWS root account. |
 | Database administrator rewrites the audit log | Daily anchors in Object Lock; verification detects mismatch. |
 | Witness PIN brute force on tablet | 6 digits, 5 tries per 15 minutes, then 30-minute lock. |
@@ -867,10 +1025,15 @@ All requests and responses are JSON unless noted. Errors use `{ "error": "messag
 
 | Method & path | Auth | Request | Response |
 |---|---|---|---|
-| `POST /api/gate/check` | none (rate-limited) | `{firstName, lastName, phone, email}` | `{result: new\|draft\|sealed\|contact_frontdesk, draftToken?, prefill?}` |
-| `GET /api/draft` | draft token | — | current draft |
+| `POST /api/gate/check` | none (rate-limited) | `{firstName, lastName, phone, email}` | `{result: new\|draft\|action_required\|sealed\|contact_frontdesk, draftToken?, prefill?}` |
+| `GET /api/draft` | draft token | — | current draft or pending update |
 | `PUT /api/draft` | draft token | partial or full draft | `{savedAt, missingCount}` |
-| `POST /api/draft/submit` | draft token | — | `{complete: true}` or 400 with missing fields |
+| `POST /api/draft/submit` | draft token | — | `{complete: true, readyToSign: bool}` or 400 with missing fields |
+| `GET /api/remote-signing/status` | draft token | — | `{readyToSign, waitingFor: [intake\|consent_preparation]}` |
+| `POST /api/remote-signing/start` | draft token | — | `{sessionId, mode, documents, consentText, bundleVersion, consentDetails, expiresAt}`; 409 if not ready |
+| `GET /api/remote-signing/preview/{intake\|consent}` | draft token + session | — | preview PDF |
+| `POST /api/remote-signing/events` | draft token + session | `{event}` | — |
+| `POST /api/seal` (remote) | draft token + session | `{documents[], signaturePng}` | as in-store |
 
 ### 17.2 Signing area
 
@@ -881,7 +1044,7 @@ All requests and responses are JSON unless noted. Errors use `{ "error": "messag
 | `GET /api/signing/preview/{intake\|consent}` | signing token | preview PDF (`application/pdf`, watermarked) |
 | `PUT /api/signing/draft` | signing token (update mode) | edit the update draft on the tablet |
 | `POST /api/signing/events` | signing token | `{event: consent.viewed\|acknowledgements.confirmed\|esignature_agreed}` |
-| `POST /api/seal` | signing token | `{documents[], signaturePng, therapistName, treatmentAreas[], areasOtherText, consentScopeWith, witnessId, witnessPin, witnessIdType}` → `{documents: [{id, type, version, sha256, tsaStatus}]}` |
+| `POST /api/seal` (in store) | signing token | `{documents[], signaturePng, witnessId, witnessPin, witnessIdType}` → `{documents: [{id, type, version, sha256, tsaStatus}]}`. Consent details come from the consent preparation, not the request. |
 
 ### 17.3 Back office
 
@@ -893,8 +1056,14 @@ All requests and responses are JSON unless noted. Errors use `{ "error": "messag
 | `GET /api/admin/clients/{id}` | frontdesk | details, versions, badges, audit trail |
 | `GET /api/admin/clients/{id}/intake` | frontdesk | health data (logged `intake.viewed`) |
 | `DELETE /api/admin/clients/{id}/draft` | frontdesk | delete abandoned DRAFT client |
-| `POST /api/admin/clients/{id}/updates` | frontdesk | start intake update |
+| `POST /api/admin/clients/{id}/updates` | frontdesk | start intake update (notifies client **[Provisional]**) |
 | `DELETE /api/admin/clients/{id}/updates/{uid}` | frontdesk | cancel update |
+| `PUT /api/admin/clients/{id}/consent-preparation` | frontdesk | `{therapistId, treatmentAreas[], areasOtherText, consentScopeWith, reason}` create or change |
+| `DELETE /api/admin/clients/{id}/consent-preparation` | frontdesk | cancel open preparation |
+| `POST /api/admin/clients/{id}/identity-verifications` | frontdesk | `{idType, staffId, pin}` record in-person ID check |
+| `POST /api/admin/clients/{id}/discussions` | therapist | `{consentDocumentId, topics[], therapistId, pin}` |
+| `GET /api/admin/today` | frontdesk, therapist | clients needing ID check or discussion |
+| `GET /api/admin/therapists` | frontdesk | active therapists |
 | `POST /api/signing/session` | frontdesk | `{clientId, mode, documents}` → `{sessionId, pairingCode, expiresAt}` |
 | `DELETE /api/signing/session/{id}` | frontdesk | cancel session |
 | `GET /api/admin/documents/{id}/download` | frontdesk | presigned URL (15 min) |
@@ -916,7 +1085,7 @@ One Angular 19 app with three lazy-loaded areas; the admin code is never downloa
 
 | Area | Routes | Notes |
 |---|---|---|
-| Client | `/` gate → `/intake` → `/done` | Mobile first. Large touch targets. Autosave indicator. |
+| Client | `/` gate → `/intake` → `/sign` (remote signing, only when ready) or `/done` (waiting) | Mobile first. Large touch targets. Autosave indicator. Signing steps reuse the same components as the tablet. |
 | Signing | `/s` (code entry) → `/s/session` (steps) | Tablet landscape and portrait. Kiosk-style: no navigation to other areas, no back-office links. Signature pad 100% width, `touch-action: none`, device-pixel-ratio aware (as in Experiment 02). Preview via pdf.js. |
 | Back office | `/admin/...` | Desktop first. Route guards by role. |
 
@@ -935,7 +1104,8 @@ Expected results describe what the system must do; each becomes at least one aut
 | A3 | Client returns to an unfinished draft | Answers restored; `draft.resumed`. |
 | A4 | Phone matches, email different | `contact_frontdesk`; no data shown. |
 | A5 | New phone, email used by a family member | Treated as new client (A1). |
-| A6 | Client already sealed tries the link again | `sealed` message; no token. |
+| A6 | Client already sealed, nothing pending, tries the link again | `sealed` message; no token. |
+| A6b | Client sealed, with an open update or re-consent | `action_required`; token scoped to the pending item. |
 | A7 | Phone typed with spaces, dashes, `+1` | Normalised; matches the same client. |
 | A8 | Email with capitals/spaces | Normalised; matches. |
 | A9 | 11 gate checks from one IP in a minute | 11th gets 429. |
@@ -957,7 +1127,7 @@ Expected results describe what the system must do; each becomes at least one aut
 | B4 | Session idle more than 30 minutes | Expired; tablet resets; new session needed; data intact. |
 | B5 | Client did not scroll to the end | Continue button disabled. |
 | B6 | One confirmation unticked | Signature pad stays inactive. |
-| B7 | No treatment area selected / "others" without text | Cannot seal. |
+| B7 | Consent not prepared by front desk ("others" without text, no area, no therapist) | Preparation cannot be saved incomplete; signing cannot start until it is. |
 | B8 | Empty signature | Sign & Seal disabled; backend rejects an empty or invalid PNG. |
 | B9 | Witness PIN wrong | Refused; count increases. |
 | B10 | Witness PIN wrong 5 times in 15 minutes | Witness locked 30 minutes; another staff member can witness; admin can unlock. |
@@ -971,6 +1141,26 @@ Expected results describe what the system must do; each becomes at least one aut
 | B18 | Client's phone collides with another sealed client at sealing | Refused (duplicate re-check). |
 | B19 | Signature drawn very small or very wide | Trimmed and scaled to fit the box, proportions kept. |
 | B20 | Very long therapist name or "others" text | Fits by shrinking; otherwise truncated with full text on the attestation page (intake) or refused above a maximum length (consent) **[to finalise in Phase 3]**. |
+| B21 | Client says prepared details are wrong (in store) | Session stops; front desk corrects; new session. |
+
+### R. Remote signing
+
+| # | Scenario | Expected |
+|---|---|---|
+| R1 | Intake complete, consent already prepared | Client goes straight to signing on the phone; both documents sealed with channel `remote`, no witness. |
+| R2 | Intake complete, consent not prepared | "We will let you know when your forms are ready to sign"; no signature pad shown. |
+| R3 | Front desk prepares consent after intake is complete | "Ready to sign" message sent **[Provisional]**; client passes gate and signs. |
+| R4 | Intake incomplete | Signature step never shown. |
+| R5 | Front desk changes the preparation while the client is mid-signing | Seal refused (preparation changed); client restarts signing with the new details. |
+| R6 | Remote session older than 30 minutes | Expired; client starts signing again; data intact. |
+| R7 | Client under 18 | Refused; guardian/paper message. |
+| R8 | Remote request includes witness fields | Rejected. |
+| R9 | First visit after remote seal | Badge "ID not checked"; front desk records ID check with PIN; badge cleared; sealed PDFs unchanged. |
+| R10 | Treatment day, remote consent | Badge "Discussion not recorded" until the therapist records it with PIN. |
+| R11 | Client prefers to sign in clinic | Ignores the message; signs on the tablet (in-store flow). |
+| R12 | Remote update requested by front desk | Client passes gate (`action_required`), edits pre-filled form, signs; new intake version, channel `remote`. |
+| R13 | Remote re-consent after new bundle | Client signs consent only; new consent version; `consent.reconsented`. |
+| R14 | Signature drawn with a finger on a small phone | Pad fills the width; strokes sharp; trimmed and scaled on the PDF. |
 
 ### C. Updates and re-consent
 
@@ -982,7 +1172,7 @@ Expected results describe what the system must do; each becomes at least one aut
 | C4 | Sixth intake version | Boxes keep updates 1–4; attestation page shows version 6. |
 | C5 | New consent bundle published | Clients on older bundles show "Re-sign consent". |
 | C6 | Re-consent session | Only consent sealed (new version); intake unchanged; `consent.reconsented`. |
-| C7 | Client tries the web link to update | `sealed` message; must go through front desk. |
+| C7 | Client tries the web link to update without a front-desk request | `sealed` message; must ask the front desk. |
 
 ### D. Back office
 
@@ -1022,7 +1212,7 @@ Expected results describe what the system must do; each becomes at least one aut
 - **Integration tests (Testcontainers PostgreSQL):** every scenario in §19 that touches the database; audit trigger and revoked privileges; concurrent audit writers; seal transaction and failure injection (fake S3 and fake TSA that can fail on demand).
 - **PDF tests:** text-layer checks that each value appears at its expected position; rendered-image checks that each X and the signature fall inside their boxes (automated pixel test on a rasterised page); manual visual sign-off when a bundle changes.
 - **Frontend tests:** Angular default unit tests for components and validators.
-- **End-to-end (Playwright):** gate → intake → pairing → tablet steps → seal, in Edge/Chromium with touch emulation; verifies outputs through the API.
+- **End-to-end (Playwright):** both channels — gate → intake → consent preparation → remote signing on an emulated phone → seal; and gate → intake → pairing → tablet steps with witness → seal. Edge/Chromium with touch emulation; outputs verified through the API.
 - **CI (GitHub Actions):** on every pull request: backend build + unit + integration tests (Docker available on runners), frontend build + tests, linting. `main` is protected: CI must pass.
 - Test data: to be defined later (not part of this document yet).
 
@@ -1097,20 +1287,34 @@ New AWS accounts (after 2025-07-15) receive up to $200 in credits, which covers 
 | 0 (done) | Experiment 01 (checkbox overlay), Experiment 02 (web signature → stamp → seal) | Verified 2026-10-06/07 |
 | 1 | Repo setup, CI, Docker PostgreSQL, schema + migrations, audit log with chain + triggers, identity gate API, draft API, staff login, `create-admin` | Scenarios A1–A14, D1–D2, E1–E2 pass in CI |
 | 2 | Client area: gate, intake form with autosave and validation, done page | A-scenarios pass end-to-end on a phone |
-| 3 | Signing area, pairing, PDF rendering (all coordinates measured and visually verified), attestation page, TSA, S3 Object Lock (staging bucket), sealing, updates, re-consent | B and C scenarios pass; lawyer sign-off on consent text, e-signature wording, age threshold |
-| 4 | Back office: clients, details, download, verify, export, import, invitations, audit viewer, users, bundles | D scenarios pass |
+| 3 | Consent preparation, signing steps (shared by phone and tablet), remote signing, tablet pairing, PDF rendering (all coordinates measured and visually verified), attestation page, TSA, S3 Object Lock (staging bucket), sealing, updates, re-consent, ID-check and discussion records | B, C and R scenarios pass; lawyer sign-off on consent text, e-signature wording, age threshold, remote signing |
+| 4 | Back office: clients, details, today list, download, verify, export, import, invitations and notifications, audit viewer, users (incl. therapists), bundles | D scenarios pass |
 | 5 | Hardening and launch: rate limits tuned, backups + restore test, monitoring, SES production, SOPs (front desk, breach response, auditor request), production deployment | E scenarios pass; go-live checklist signed |
 
-## 24. Open items (business and legal)
+## 24. Open items
+
+### 24.1 Business and legal
 
 | # | Item | Owner | Blocks |
 |---|---|---|---|
-| 1 | Insurers' written answers: electronic signatures accepted, records required at audit, required fields/wording, retention, delivery format | Business (letter drafted: `Letter-to-Insurer.md`) | Go-live |
+| 1 | Insurers' written answers: electronic signatures accepted, **remote signing accepted**, records required at audit, required fields/wording, retention, delivery format | Business (letter drafted: `Letter-to-Insurer.md`) | Go-live |
 | 2 | Therapist credentials and which benefit category claims fall under | Business | Go-live |
-| 3 | Lawyer opinion on all questions in `Letter-to-Lawyer.md`, including: which privacy law applies (PHIPA or PIPEDA), validity of the e-signature process, consent text, e-signature checkbox wording, age threshold and substitute decision-makers, retention period, whether a health card may be requested as ID, consent to share records with insurers, invitation messages and anti-spam law | Business + lawyer | Phase 3 (text, age, wording), go-live (rest) |
+| 3 | Lawyer opinion on all questions in `Letter-to-Lawyer.md`, including: which privacy law applies (PHIPA or PIPEDA), validity of the e-signature process **in store and remote (phone + email only)**, consent text **and the "I have discussed" wording for remote signing**, e-signature checkbox wording, age threshold and substitute decision-makers, retention period, whether a health card may be requested as ID, consent to share records with insurers, invitation messages and anti-spam law | Business + lawyer | Phase 3 (text, age, wording, remote), go-live (rest) |
 | 4 | Consent form typos ("OSTEOAPTHIC", "sourness"): keep verbatim or correct in a new bundle | Lawyer + business | Bundle v1 |
 | 5 | SES production access and domain verification | Business/Steven | Phase 5 |
 | 6 | Clinic legal name, address, sending domain | Business | Letters, SES |
+
+### 24.2 Provisional design decisions (not yet confirmed by Steven)
+
+| # | Question | Working assumption |
+|---|---|---|
+| P1 | Notify the client when consent is prepared and the form is complete? | Yes: "ready to sign" email/SMS with first name + generic link. |
+| P2 | One signature for both documents, or separate? | One signature, shown only when both are complete (follows "show signature only when everything is filled in"). |
+| P3 | Therapists in the system? | New `therapist` role with own account and PIN; consent therapist chosen from that list; therapist records the discussion. |
+| P4 | Discussion record for in-store consents too? | Yes, same badge and list. |
+| P5 | Who can start a remote update? | Front desk only; client is notified. |
+| P6 | Notify clients to re-sign after a new bundle? | Yes, per client when front desk prepares the new consent. |
+| P7 | First-visit ID check details | Front desk with PIN, ID type recorded, skipped if the client already signed in store. |
 
 ## 25. Decision log
 
@@ -1120,7 +1324,7 @@ New AWS accounts (after 2025-07-15) receive up to $200 in credits, which covers 
 | 2026-10-06 | Sign and seal at the same moment; SHA-256 over PDF bytes only. |
 | 2026-10-07 | Coordinates come from experiments, not estimates (others, leg, signature line and box). |
 | 2026-10-07 | Intake gets a generated attestation page; page 1 stays identical to the paper form. No self-hash on the page; Record ID instead. |
-| 2026-10-07 | Versioned sealed documents; updates on the tablet in one witnessed session; client stays SEALED. |
+| 2026-10-07 | Versioned sealed documents; client stays SEALED during updates. (Updates "on the tablet only" was later replaced by the remote-signing decision below.) |
 | 2026-10-07 | Orphaned S3 files tracked by a sweeper; separate non-Compliance bucket for dev/test. |
 | 2026-10-07 | No Mapbox in v1 (data residency). |
 | 2026-10-07 | Gate match key = phone + email; names recorded only; walk-ins self-register; partial match → front desk. |
@@ -1134,15 +1338,15 @@ New AWS accounts (after 2025-07-15) receive up to $200 in credits, which covers 
 | 2026-10-07 | Docker + Testcontainers + xUnit + Angular tests + GitHub Actions from the start. |
 | 2026-10-07 | Defaults accepted: partial match → front desk; new yes/no columns for surgery, injury, gynaecological conditions, medications; `create-admin` command; Notes blank; `doc/` → `docs/` + `templates/`. |
 | 2026-10-07 | This document (v2) replaces the TECHSPEC. New in v2 (for review): tablet pairing code instead of token URL; `signing_sessions` and `storage_orphans` tables; single `bundle_version`; TSA requested before the database commit; `document.timestamped` action. |
+| 2026-10-07 | **v1 supports remote signing** for both forms, updates and re-consent; in-store signing kept. Remote identity = phone + email match only (no one-time code). Signature shown only when everything is complete. Front desk prepares therapist, areas and scope when booking. Therapist records the pre-treatment discussion. Front desk records an in-person ID check at the first visit after remote signing. |
 
 ## 26. Future (v2 and later)
 
-- Remote signing at home (with one-time code to the client's phone).
+- One-time code to the client's phone before remote signing (if the lawyer or an insurer requires stronger proof of identity).
 - Legal guardian / substitute decision-maker signing.
 - Per-client invitation links (one tap, no gate).
 - Address autocomplete hosted in Canada (if the lawyer approves).
 - Chinese (and other) UI translations alongside the English legal text.
-- Remote intake updates by link.
 - Cross-region backup replication (within Canada).
 - Insurer-facing verification page (upload a PDF, see whether it matches a sealed record).
 - Integration with booking/billing so consented treatment areas can be checked against invoices.
